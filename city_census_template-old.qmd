@@ -1,0 +1,493 @@
+---
+title: "Longitudinal Census Data Template"
+subtitle: "PEP Population + ACS Socioeconomics + Decennial Anchors + Inflation Adjustment"
+author: "Dan"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  # =========================================================================
+  # CHANGE THESE FOR A DIFFERENT CITY
+  # =========================================================================
+  city: "Schertz"
+  state: "TX"
+  # =========================================================================
+  # Year ranges for data pulls
+  years_pep: !expr 2010:2024
+  years_acs: !expr 2011:2023
+  # Inflation base year (for constant-dollar conversions)
+  base_year: 2024
+  # Cache directories (keeps API traffic low; add to .gitignore)
+  cache_census_dir: "cache/census"
+  cache_inflation_dir: "cache/inflation"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# -----------------------------------------------------------------------------
+# Package verification
+# -----------------------------------------------------------------------------
+required_pkgs <- c(
+"tidycensus", "tigris", "dplyr", "purrr", "tibble", "stringr", "readr",
+"digest", "lubridate", "quantmod", "zoo", "rlang", "ggplot2",
+"flextable"
+)
+
+missing <- required_pkgs[
+!base::vapply(required_pkgs, requireNamespace, logical(1L), quietly = TRUE)
+]
+
+if (base::length(missing) > 0L) {
+base::stop(
+  "Install missing packages:\n",
+  base::paste(missing, collapse = ", ")
+)
+}
+
+# -----------------------------------------------------------------------------
+# Source helper functions
+# -----------------------------------------------------------------------------
+base::source("R/census_helpers.R")
+
+# -----------------------------------------------------------------------------
+# Options
+# -----------------------------------------------------------------------------
+base::options(tigris_use_cache = TRUE)
+```
+
+```{r}
+#| label: fallback-params
+#| include: false
+
+# Fallback for interactive use outside Quarto render
+if (!base::exists("params")) {
+params <- base::list(
+  city               = "Schertz",
+  state              = "TX",
+  years_pep          = 2010:2024,
+  years_acs          = 2011:2023,
+  base_year          = 2024,
+  cache_census_dir   = "cache/census",
+  cache_inflation_dir = "cache/inflation"
+)
+}
+```
+
+# Overview
+
+This template generates a unified longitudinal dataset for **`r params$city`, `r params$state`** combining:
+
+- **PEP**: Annual population estimates (2010–2024)
+- **ACS 5-Year**: Selected socioeconomic indicators
+- **Decennial**: Census anchors (2000, 2010, 2020)
+- **CPI-U**: Inflation adjustment factors for constant-dollar analysis
+
+All API calls are cached to minimize traffic. Output uses a normalized schema: `source`, `series`, `year`, `estimate`, `moe`.
+
+
+# PEP Annual Population
+
+Population Estimates Program data for `r params$city`.
+
+```{r}
+#| label: pep-pull
+
+pep <- ds_get_pep_population_place(
+city      = params$city,
+state     = params$state,
+years     = params$years_pep,
+cache_dir = params$cache_census_dir
+)
+```
+
+```{r}
+#| label: pep-table
+
+pep_display <- pep |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  Population = base::format(estimate, big.mark = ",", scientific = FALSE)
+) |>
+dplyr::select(Year = year, Source = source, Population)
+
+ft_pep <- flextable::flextable(pep_display)
+ft_pep <- ds_style_flextable(
+ft_pep,
+title = base::paste0("PEP Population: ", params$city, ", ", params$state)
+)
+ft_pep <- flextable::colformat_int(ft_pep, j = "Year", big.mark = "")
+
+ft_pep
+
+```
+
+
+# ACS 5-Year Indicators
+
+Selected American Community Survey variables. Modify `acs_vars` below to change which indicators are pulled.
+
+```{r}
+#| label: acs-vars
+
+# -------------------------------------------------------------------------
+# ACS VARIABLE CODES - MODIFY THIS SECTION FOR DIFFERENT INDICATORS
+# -------------------------------------------------------------------------
+# Format: friendly_name = "TABLE_VARIABLE"
+# Common examples:
+#   B19013_001 = Median household income
+#   B25001_001 = Total housing units
+#   B01003_001 = Total population (ACS estimate)
+#   B25077_001 = Median home value
+#   B23025_005 = Unemployed (civilian labor force)
+# -------------------------------------------------------------------------
+
+acs_vars <- c(
+median_hh_income = "B19013_001",
+housing_units    = "B25001_001",
+population_acs   = "B01003_001"
+)
+```
+
+```{r}
+#| label: acs-pull
+
+acs <- ds_get_acs_place(
+city      = params$city,
+state     = params$state,
+years     = params$years_acs,
+variables = base::unname(acs_vars),
+survey    = "acs5",
+cache_dir = params$cache_census_dir
+)
+
+# Map variable codes to friendly labels
+var_labels <- stats::setNames(base::names(acs_vars), acs_vars)
+acs$series_label <- var_labels[acs$series]
+acs$series_label <- base::ifelse(
+base::is.na(acs$series_label),
+acs$series,
+acs$series_label
+)
+```
+
+```{r}
+#| label: acs-table
+
+acs_display <- acs |>
+dplyr::arrange(series_label, year) |>
+dplyr::mutate(
+  estimate = base::format(
+    base::round(estimate, 0),
+    big.mark = ",",
+    scientific = FALSE
+  ),
+  moe = base::ifelse(
+    base::is.na(moe),
+    "—",
+    base::format(base::round(moe, 0), big.mark = ",")
+  )
+) |>
+dplyr::select(
+  Year     = year,
+  Variable = series_label,
+  Estimate = estimate,
+  MOE      = moe
+)
+
+ft_acs <- flextable::flextable(acs_display)
+ft_acs <- ds_style_flextable(
+ft_acs,
+title = base::paste0("ACS 5-Year Estimates: ", params$city, ", ", params$state)
+)
+ft_acs <- flextable::colformat_int(ft_acs, j = "Year", big.mark = "")
+
+ft_acs
+```
+
+
+# Decennial Census Anchors
+
+Official Census counts from 2000, 2010, and 2020.
+
+```{r}
+#| label: decennial-pull
+
+# Variable codes differ by census year
+# 2000/2010 SF1: P001001 (total population)
+# 2020 PL: P1_001N (total population)
+
+dec_2000 <- ds_get_decennial_place(
+params$city, params$state,
+year = 2000L, variable = "P001001", sumfile = "sf1",
+cache_dir = params$cache_census_dir
+)
+
+dec_2010 <- ds_get_decennial_place(
+params$city, params$state,
+year = 2010L, variable = "P001001", sumfile = "sf1",
+cache_dir = params$cache_census_dir
+)
+
+dec_2020 <- ds_get_decennial_place(
+params$city, params$state,
+year = 2020L, variable = "P1_001N", sumfile = "pl",
+cache_dir = params$cache_census_dir
+)
+
+decennial <- dplyr::bind_rows(dec_2000, dec_2010, dec_2020)
+decennial$series <- "population_decennial"
+```
+
+```{r}
+#| label: decennial-table
+
+dec_display <- decennial |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  Population = base::format(estimate, big.mark = ",", scientific = FALSE)
+) |>
+dplyr::select(Year = year, Source = source, Population)
+
+ft_dec <- flextable::flextable(dec_display)
+ft_dec <- ds_style_flextable(
+ft_dec,
+title = base::paste0("Decennial Census: ", params$city, ", ", params$state)
+)
+ft_dec <- flextable::colformat_int(ft_dec, j = "Year", big.mark = "")
+
+ft_dec
+```
+
+
+# Unified Longitudinal Dataset
+
+Combined dataset with normalized schema across all sources.
+
+```{r}
+#| label: unify
+
+pep_long <- pep
+pep_long$series_label <- "population_pep"
+
+acs_long <- acs
+acs_long$series_label <- base::ifelse(
+base::is.na(acs_long$series_label),
+acs_long$series,
+acs_long$series_label
+)
+
+dec_long <- decennial
+dec_long$series_label <- "population_decennial"
+
+longitudinal <- dplyr::bind_rows(pep_long, acs_long, dec_long)
+longitudinal <- longitudinal |>
+dplyr::select(source, series_label, year, estimate, moe) |>
+dplyr::arrange(series_label, year)
+```
+
+```{r}
+#| label: longitudinal-summary
+
+summary_tbl <- longitudinal |>
+dplyr::group_by(series_label) |>
+dplyr::summarise(
+  year_min = base::min(year, na.rm = TRUE),
+  year_max = base::max(year, na.rm = TRUE),
+  n_obs    = dplyr::n(),
+  .groups  = "drop"
+)
+
+ft_summary <- flextable::flextable(summary_tbl)
+ft_summary <- flextable::set_header_labels(
+ft_summary,
+series_label = "Series",
+year_min     = "First Year",
+year_max     = "Last Year",
+n_obs        = "Observations"
+)
+ft_summary <- flextable::colformat_int(ft_summary, j = c("year_min", "year_max"), big.mark = "")
+ft_summary <- ds_style_flextable(ft_summary, title = "Longitudinal Dataset Summary")
+
+ft_summary
+```
+
+
+# Inflation Adjustment
+
+CPI-U annual averages from FRED for converting nominal dollars to `r params$base_year` constant dollars.
+
+```{r}
+#| label: cpi-pull
+
+year_min <- base::min(c(params$years_acs, params$years_pep), na.rm = TRUE)
+year_max <- base::max(c(params$years_acs, params$years_pep), na.rm = TRUE)
+
+cpi_tbl <- ds_get_cpi_annual(
+start_year = year_min,
+end_year   = year_max,
+base_year  = params$base_year,
+cache_dir  = params$cache_inflation_dir
+)
+```
+
+```{r}
+#| label: cpi-table
+
+cpi_display <- cpi_tbl |>
+dplyr::mutate(
+  year = base::as.character(year),
+  base_year = base::as.character(base_year),
+  cpi_annual_avg = base::round(cpi_annual_avg, 2),
+  factor_to_base = base::round(factor_to_base, 4)
+) |>
+dplyr::select(
+  Year        = year,
+  `CPI-U Avg` = cpi_annual_avg,
+  `Base Year` = base_year,
+  Factor      = factor_to_base
+)
+
+ft_cpi <- flextable::flextable(cpi_display)
+ft_cpi <- ds_style_flextable(
+  ft_cpi,
+  title = base::paste0("CPI-U Inflation Factors (Base: ", params$base_year, ")")
+)
+ft_cpi
+```
+
+
+# Real Income Analysis
+
+Median household income adjusted to `r params$base_year` dollars.
+```{r}
+#| label: income-real
+
+income_nominal <- acs_long |>
+dplyr::filter(series_label == "median_hh_income") |>
+dplyr::select(source, series_label, year, estimate, moe)
+
+if (base::nrow(income_nominal) > 0L) {
+income_real <- ds_adjust_to_base_dollars(
+  df        = income_nominal,
+  value_col = "estimate",
+  year_col  = "year",
+  cpi_tbl   = cpi_tbl,
+  out_col   = "estimate_real"
+)
+} else {
+income_real <- tibble::tibble()
+}
+```
+
+```{r}
+#| label: income-table
+#| eval: !expr nrow(income_real) > 0
+
+income_display <- income_real |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  Year          = base::as.character(year),
+  Nominal       = base::paste0("$", base::format(base::round(estimate, 0), big.mark = ",")),
+  Real          = base::paste0("$", base::format(base::round(estimate_real, 0), big.mark = ","))
+) |>
+dplyr::select(Year, Nominal, Real)
+
+ft_income <- flextable::flextable(income_display)
+ft_income <- ds_style_flextable(
+  ft_income,
+  title = base::paste0("Median Household Income (", params$base_year, " Dollars)")
+)
+ft_income
+```
+
+
+# Population Trend (XmR Chart)
+
+Statistical process control chart for PEP population estimates.
+
+```{r}
+#| label: xmr-chart
+#| fig-width: 8
+#| fig-height: 5
+
+pop_chart <- pep_long |>
+dplyr::select(year, estimate) |>
+dplyr::arrange(year)
+
+ds_plot_xmr(
+df        = pop_chart,
+year_col  = "year",
+value_col = "estimate",
+title     = base::paste0("Population XmR: ", params$city, ", ", params$state)
+)
+
+```
+
+
+# Export Data
+
+```{r}
+#| label: export
+
+# base::dir.create("out", showWarnings = FALSE, recursive = TRUE)
+# 
+# readr::write_csv(
+# longitudinal,
+# base::file.path("out", "longitudinal_place_series.csv")
+# )
+# 
+# readr::write_csv(
+# cpi_tbl,
+# base::file.path("out", "inflation_cpi_table.csv")
+# )
+# 
+# if (base::nrow(income_real) > 0L) {
+# readr::write_csv(
+#   income_real,
+#   base::file.path("out", "income_real_base_year.csv")
+# )
+# }
+
+```
+
+Data exported to `out/` directory:
+
+- `longitudinal_place_series.csv` — All series combined
+- `inflation_cpi_table.csv` — CPI factors
+- `income_real_base_year.csv` — Inflation-adjusted income
+
+
+# Using This Template for Other Cities
+To analyze a different city, change only these parameters in the YAML header:
+
+```yaml
+params:
+city: "Austin"
+state: "TX"
+```
+
+Everything else adapts automatically. Clear your cache directory if switching cities:
+
+```r
+unlink("cache", recursive = TRUE)
+```
+
+
+## Notes
+
+- **1990 Decennial**: Not supported by tidycensus for place-level data. Use NHGIS for earlier years.
+- **ACS Years**: ACS 5-year estimates are labeled by end-year. First available: 2009 (covering 2005–2009).
+- **PEP 2020+**: Uses Census Bureau Excel files since tidycensus API coverage ends at 2019.
