@@ -1,0 +1,1047 @@
+---
+title: "Government Employee Earnings Analysis (PUMS Microdata)"
+subtitle: "By Level of Government: Local, State, Federal"
+author: "Dan"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: params
+#| include: false
+
+# =============================================================================
+# PARAMETERS - CHANGE THESE FOR A DIFFERENT CITY/YEARS
+# =============================================================================
+
+params <- base::list(
+  city       = "Schertz",
+  state      = "TX",
+  years      = 2019:2023,
+  min_age    = 20L,
+  survey     = "acs5",
+  base_year  = 2023,
+  cache_dir  = "cache/pums_gov"
+)
+
+# =============================================================================
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+# -----------------------------------------------------------------------------
+# Package verification
+# -----------------------------------------------------------------------------
+required_pkgs <- c(
+  "tidycensus", "tigris", "dplyr", "purrr", "tibble", "stringr", "tidyr",
+  "digest", "lubridate", "quantmod", "zoo", "ggplot2", "flextable",
+  "srvyr", "survey", "readr", "writexl", "sf"
+)
+
+missing <- required_pkgs[
+  !base::vapply(required_pkgs, requireNamespace, logical(1L), quietly = TRUE)
+]
+
+if (base::length(missing) > 0L) {
+  base::stop("Install missing packages:\n", base::paste(missing, collapse = ", "))
+}
+
+# -----------------------------------------------------------------------------
+# Options
+# -----------------------------------------------------------------------------
+base::options(
+  tigris_use_cache = TRUE,
+  tidycensus.show_progress = FALSE,
+  survey.lonely.psu = "adjust"
+)
+```
+
+```{r}
+#| label: helper-functions
+#| include: false
+
+# -----------------------------------------------------------------------------
+# Caching utilities
+# -----------------------------------------------------------------------------
+
+ds_cache_path <- function(cache_dir, key, ext = "rds") {
+  base::dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  base::file.path(cache_dir, base::paste0(key, ".", ext))
+}
+
+ds_cache_key <- function(prefix, params) {
+  digest::digest(base::list(prefix = prefix, params = params), algo = "xxhash64")
+}
+
+ds_cache_read <- function(path) {
+  if (base::file.exists(path)) base::readRDS(path) else NULL
+}
+
+ds_cache_write <- function(x, path) {
+  base::dir.create(base::dirname(path), showWarnings = FALSE, recursive = TRUE)
+  base::saveRDS(x, path)
+  base::invisible(x)
+}
+
+# -----------------------------------------------------------------------------
+# Find PUMAs containing a city (spatial intersection)
+# -----------------------------------------------------------------------------
+
+ds_get_city_pumas <- function(city, state, year = 2020, cache_dir) {
+  key <- ds_cache_key("city_pumas", base::list(city = city, state = state, year = year))
+  path <- ds_cache_path(cache_dir, key)
+  cached <- ds_cache_read(path)
+  if (!base::is.null(cached)) return(cached)
+  
+  # Get PUMA boundaries (suppress download messages)
+  pumas <- base::suppressMessages(
+    tigris::pumas(state = state, year = year, progress_bar = FALSE)
+  )
+  
+  # Get place (city) boundaries
+  places <- base::suppressMessages(
+    tigris::places(state = state, year = year, progress_bar = FALSE)
+  )
+  
+  # Find the city
+  city_pattern <- base::paste0("^", city, " city")
+  city_sf <- places[base::grepl(city_pattern, places$NAME, ignore.case = TRUE), ]
+  
+  if (base::nrow(city_sf) == 0L) {
+    city_sf <- places[base::grepl(
+      base::paste0("^", city, "$"),
+      places$NAME,
+      ignore.case = TRUE
+    ), ]
+  }
+  
+  if (base::nrow(city_sf) == 0L) {
+    base::stop(
+      "City '", city, "' not found in ", state, ". ",
+      "Check spelling or try a nearby larger city."
+    )
+  }
+  
+  # Find PUMAs that intersect with the city
+  city_sf <- sf::st_transform(city_sf, sf::st_crs(pumas))
+  intersecting <- base::suppressMessages(
+    sf::st_intersects(pumas, city_sf, sparse = FALSE)
+  )
+  city_pumas <- pumas[base::apply(intersecting, 1, base::any), ]
+  
+  if (base::nrow(city_pumas) == 0L) {
+    base::stop("No PUMAs found intersecting '", city, "'. This shouldn't happen.")
+  }
+  
+  # Extract PUMA codes
+  puma_col <- base::grep("^PUMACE", base::names(city_pumas), value = TRUE)[1L]
+  puma_codes <- city_pumas[[puma_col]]
+  
+  result <- base::list(
+    puma_codes = puma_codes,
+    puma_names = city_pumas$NAMELSAD20,
+    city_name = city_sf$NAME[1L],
+    n_pumas = base::length(puma_codes)
+  )
+  
+  ds_cache_write(result, path)
+}
+
+# -----------------------------------------------------------------------------
+# PUMS data retrieval with COW (Class of Worker) variable
+# -----------------------------------------------------------------------------
+
+ds_get_pums_gov_earnings <- function(city, state, puma_codes, year, min_age = 20L,
+                                     survey = "acs5", cache_dir) {
+  key <- ds_cache_key("pums_gov_earnings", base::list(
+    city = city, state = state, puma_codes = puma_codes,
+    year = year, min_age = min_age, survey = survey
+  ))
+  path <- ds_cache_path(cache_dir, key)
+  cached <- ds_cache_read(path)
+  if (!base::is.null(cached)) return(cached)
+  
+  # PUMS variables:
+  # AGEP = Age
+  # WAGP = Wages/salary income
+  # SEMP = Self-employment income
+  # COW = Class of Worker
+  # PUMA = Public Use Microdata Area
+  
+  pums_vars <- base::c("AGEP", "WAGP", "SEMP", "COW", "PUMA")
+  
+  # Build filter for age
+  age_filter <- base::list(AGEP = min_age:99L)
+  
+  # Suppress download progress messages
+  raw <- base::suppressMessages(
+    tidycensus::get_pums(
+      variables        = pums_vars,
+      state            = state,
+      year             = year,
+      survey           = survey,
+      variables_filter = age_filter,
+      rep_weights      = "person",
+      recode           = TRUE
+    )
+  )
+  
+  # Filter to PUMAs containing the city
+ raw <- raw[raw$PUMA %in% puma_codes, ]
+  
+  if (base::nrow(raw) == 0L) {
+    base::warning("No PUMS records found for ", city, " PUMAs in year ", year)
+    return(NULL)
+  }
+  
+  # Calculate total earnings (wages + self-employment)
+  raw$earnings <- base::as.numeric(raw$WAGP) + base::as.numeric(raw$SEMP)
+  raw$earnings <- base::ifelse(raw$earnings < 0, 0, raw$earnings)
+  
+  # Create government level labels
+  # COW codes: 3 = Local, 4 = State, 5 = Federal
+  raw$gov_level <- base::ifelse(
+    raw$COW == "3", "Local Government",
+    base::ifelse(
+      raw$COW == "4", "State Government",
+      base::ifelse(
+        raw$COW == "5", "Federal Government",
+        NA_character_
+      )
+    )
+  )
+  
+  # Add year column
+  raw$year <- year
+  
+  ds_cache_write(raw, path)
+}
+
+# -----------------------------------------------------------------------------
+# CPI / Inflation
+# -----------------------------------------------------------------------------
+
+ds_get_cpi_annual <- function(start_year, end_year, base_year, cache_dir) {
+  key <- ds_cache_key("cpi_annual", base::list(
+    start_year = start_year, end_year = end_year, base_year = base_year
+  ))
+  path <- ds_cache_path(cache_dir, key)
+  cached <- ds_cache_read(path)
+  if (!base::is.null(cached)) return(cached)
+  
+  xt <- base::suppressMessages(
+    quantmod::getSymbols("CPIAUCSL", src = "FRED", auto.assign = FALSE)
+  )
+  df <- tibble::tibble(
+    date = base::as.Date(zoo::index(xt)),
+    cpi  = base::as.numeric(xt[, 1L])
+  )
+  df$year <- lubridate::year(df$date)
+  df <- df[df$year >= start_year & df$year <= end_year, ]
+  
+  annual <- dplyr::summarise(
+    dplyr::group_by(df, year),
+    cpi_annual_avg = base::mean(cpi, na.rm = TRUE),
+    .groups = "drop"
+  )
+  
+  base_cpi <- annual$cpi_annual_avg[annual$year == base_year]
+  if (base::length(base_cpi) != 1L) {
+    base::stop("Base year CPI not found for year ", base_year)
+  }
+  
+  annual$base_year <- base_year
+  annual$factor_to_base <- base_cpi / annual$cpi_annual_avg
+  
+  ds_cache_write(annual, path)
+}
+
+# -----------------------------------------------------------------------------
+# Flextable styling
+# -----------------------------------------------------------------------------
+
+ds_style_flextable <- function(ft, title = NULL) {
+  if (!base::is.null(title)) {
+    ft <- flextable::add_header_lines(ft, values = title)
+    ft <- flextable::color(ft, i = 1, part = "header", color = "blue")
+    ft <- flextable::italic(ft, i = 1, part = "header")
+    ft <- flextable::align(ft, i = 1, part = "header", align = "left")
+    ft <- flextable::fontsize(ft, i = 1, part = "header", size = 12)
+    ft <- flextable::bg(ft, i = 1, part = "header", bg = "white")
+    ft <- flextable::bg(ft, i = 2, part = "header", bg = "palegreen")
+  } else {
+    ft <- flextable::bg(ft, i = 1, part = "header", bg = "palegreen")
+  }
+  ft <- flextable::autofit(ft)
+  ft
+}
+```
+
+# Overview
+
+This document analyzes earnings for **government employees** (adults `r params$min_age`+) in the **`r params$city`, `r params$state` area** using PUMS microdata, broken down by level of government.
+
+**Class of Worker (COW) Codes:**
+
+| Code | Description |
+|------|-------------|
+| 1 | Private for-profit employee |
+| 2 | Private not-for-profit employee |
+| 3 | **Local government employee** |
+| 4 | **State government employee** |
+| 5 | **Federal government employee** |
+| 6-9 | Self-employed and unpaid family |
+
+**This analysis focuses on COW codes 3, 4, and 5** (government employees only).
+
+
+# PUMA Identification
+
+```{r}
+#| label: find-pumas
+
+# Find PUMAs containing the city
+city_puma_info <- ds_get_city_pumas(
+  city      = params$city,
+  state     = params$state,
+  year      = 2020,
+  cache_dir = params$cache_dir
+)
+
+puma_codes <- city_puma_info$puma_codes
+```
+
+**`r params$city`** is located in **`r city_puma_info$n_pumas`** PUMA(s):
+
+```{r}
+#| label: puma-table
+
+puma_display <- tibble::tibble(
+  `PUMA Code` = city_puma_info$puma_codes,
+  `PUMA Name` = city_puma_info$puma_names
+)
+
+ft_puma <- flextable::flextable(puma_display)
+ft_puma <- ds_style_flextable(
+  ft_puma,
+  title = base::paste0("PUMAs Containing ", params$city, ", ", params$state)
+)
+ft_puma
+```
+
+```{r}
+#| label: puma-map
+#| fig-width: 9
+#| fig-height: 7
+
+# Get spatial data for mapping
+pumas_sf <- base::suppressMessages(
+  tigris::pumas(state = params$state, year = 2020, progress_bar = FALSE)
+)
+places_sf <- base::suppressMessages(
+  tigris::places(state = params$state, year = 2020, progress_bar = FALSE)
+)
+
+# Find the city boundary
+city_pattern <- base::paste0("^", params$city, " city")
+city_sf <- places_sf[base::grepl(city_pattern, places_sf$NAME, ignore.case = TRUE), ]
+if (base::nrow(city_sf) == 0L) {
+  city_sf <- places_sf[base::grepl(
+    base::paste0("^", params$city, "$"), places_sf$NAME, ignore.case = TRUE
+  ), ]
+}
+
+# Get the PUMAs containing the city
+puma_col <- base::grep("^PUMACE", base::names(pumas_sf), value = TRUE)[1L]
+city_pumas_sf <- pumas_sf[pumas_sf[[puma_col]] %in% puma_codes, ]
+
+# Get city centroid for map centering
+city_centroid <- base::suppressMessages(
+  sf::st_centroid(sf::st_union(city_sf))
+)
+city_coords <- sf::st_coordinates(city_centroid)
+
+# Create bounding box
+puma_bbox <- sf::st_bbox(city_pumas_sf)
+x_range <- base::as.numeric(puma_bbox["xmax"] - puma_bbox["xmin"])
+y_range <- base::as.numeric(puma_bbox["ymax"] - puma_bbox["ymin"])
+
+x_expand <- x_range * 0.2
+y_expand <- y_range * 0.2
+
+xlim <- base::c(
+  base::as.numeric(puma_bbox["xmin"]) - x_expand, 
+  base::as.numeric(puma_bbox["xmax"]) + x_expand
+)
+ylim <- base::c(
+  base::as.numeric(puma_bbox["ymin"]) - y_expand, 
+  base::as.numeric(puma_bbox["ymax"]) + y_expand
+)
+
+# Get neighboring PUMAs for context
+view_bbox <- sf::st_bbox(
+  base::c(xmin = xlim[1], ymin = ylim[1], xmax = xlim[2], ymax = ylim[2]),
+  crs = sf::st_crs(pumas_sf)
+)
+view_polygon <- base::suppressMessages(sf::st_as_sfc(view_bbox))
+
+all_pumas_in_view <- base::suppressMessages(
+  pumas_sf[sf::st_intersects(pumas_sf, view_polygon, sparse = FALSE)[, 1], ]
+)
+
+# Find major cities within the PUMAs
+places_in_pumas <- base::suppressMessages(
+  places_sf[sf::st_intersects(places_sf, city_pumas_sf, sparse = FALSE)[, 1], ]
+)
+places_in_pumas <- places_in_pumas[
+  base::grepl("city|town", places_in_pumas$NAMELSAD, ignore.case = TRUE),
+]
+
+places_to_label <- NULL
+if (base::nrow(places_in_pumas) > 0L) {
+  places_in_pumas <- places_in_pumas[base::order(-places_in_pumas$ALAND), ]
+  places_in_pumas <- places_in_pumas[
+    !base::grepl(base::paste0("^", params$city), places_in_pumas$NAME, ignore.case = TRUE),
+  ]
+  if (base::nrow(places_in_pumas) > 0L) {
+    places_to_label <- utils::head(places_in_pumas, 6)
+    places_to_label$centroid <- base::suppressMessages(
+      sf::st_centroid(places_to_label$geometry)
+    )
+    place_coords <- sf::st_coordinates(places_to_label$centroid)
+    places_to_label$label_x <- place_coords[, "X"]
+    places_to_label$label_y <- place_coords[, "Y"]
+  }
+}
+
+# Create the map
+p_map <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = all_pumas_in_view,
+    fill = "gray90",
+    color = "gray60",
+    linewidth = 0.3
+  ) +
+  ggplot2::geom_sf(
+    data = city_pumas_sf,
+    fill = "lightblue",
+    color = "steelblue",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_sf(
+    data = city_sf,
+    fill = "tomato",
+    color = "darkred",
+    linewidth = 1,
+    alpha = 0.4
+  ) +
+  ggplot2::geom_sf_label(
+    data = city_pumas_sf,
+    ggplot2::aes(label = base::paste0("PUMA\n", .data[[puma_col]])),
+    size = 3,
+    fill = "white",
+    alpha = 0.8
+  ) +
+  ggplot2::annotate(
+    "text",
+    x = city_coords[1, "X"],
+    y = city_coords[1, "Y"],
+    label = params$city,
+    fontface = "bold",
+    size = 4,
+    color = "darkred"
+  ) +
+  ggplot2::coord_sf(xlim = xlim, ylim = ylim) +
+  ggplot2::labs(
+    title = base::paste0("PUMA Coverage Area: ", params$city, ", ", params$state),
+    subtitle = "Red = Target city | Blue = PUMA boundary | Gray = Neighboring PUMAs",
+    caption = "PUMS microdata represents the entire blue PUMA area(s)."
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold"),
+    axis.title = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_line(color = "gray85", linewidth = 0.2)
+  )
+
+if (!base::is.null(places_to_label) && base::nrow(places_to_label) > 0L) {
+  p_map <- p_map +
+    ggplot2::geom_sf(
+      data = places_to_label,
+      fill = NA,
+      color = "gray50",
+      linewidth = 0.5,
+      linetype = "dashed"
+    ) +
+    ggplot2::geom_text(
+      data = places_to_label,
+      ggplot2::aes(x = label_x, y = label_y, label = NAME),
+      size = 2.5,
+      color = "gray30",
+      fontface = "italic"
+    )
+}
+
+base::suppressWarnings(base::print(p_map))
+```
+
+**Other cities/towns included in the PUMA data area:**
+
+```{r}
+#| label: cities-in-puma-table
+
+if (!base::is.null(places_to_label) && base::nrow(places_to_label) > 0L) {
+  cities_display <- tibble::tibble(
+    City = places_to_label$NAME,
+    Type = base::gsub(".*(city|town).*", "\\1", places_to_label$NAMELSAD, ignore.case = TRUE)
+  )
+  
+  ft_cities <- flextable::flextable(cities_display)
+  ft_cities <- ds_style_flextable(
+    ft_cities,
+    title = base::paste0("Major Cities/Towns in ", params$city, " PUMA Area")
+  )
+  ft_cities
+} else {
+  base::cat("No other major cities found in the PUMA area.")
+}
+```
+
+
+# Data Retrieval
+
+```{r}
+#| label: pull-pums
+
+# Pull PUMS data for each year
+pums_list <- purrr::map(params$years, function(y) {
+  tryCatch({
+    ds_get_pums_gov_earnings(
+      city       = params$city,
+      state      = params$state,
+      puma_codes = puma_codes,
+      year       = y,
+      min_age    = params$min_age,
+      survey     = params$survey,
+      cache_dir  = params$cache_dir
+    )
+  }, error = function(e) {
+    base::warning("Failed to get PUMS for year ", y, ": ", e$message)
+    NULL
+  })
+})
+
+# Remove failed years
+pums_list <- pums_list[!base::vapply(pums_list, base::is.null, logical(1L))]
+
+# Combine all years
+pums_all <- dplyr::bind_rows(pums_list)
+```
+
+```{r}
+#| label: cpi-data
+
+# Get CPI for inflation adjustment
+cpi_tbl <- ds_get_cpi_annual(
+  start_year = base::min(params$years),
+  end_year   = base::max(params$years),
+  base_year  = params$base_year,
+  cache_dir  = params$cache_dir
+)
+
+# Create inflation rate data frame
+inflation_rate <- cpi_tbl |>
+  dplyr::arrange(year) |>
+  dplyr::mutate(
+    cpi_prior = dplyr::lag(cpi_annual_avg),
+    inflation_pct = (cpi_annual_avg - cpi_prior) / cpi_prior * 100
+  ) |>
+  dplyr::filter(!base::is.na(inflation_pct)) |>
+  dplyr::select(year, cpi_annual_avg, inflation_pct)
+```
+
+```{r}
+#| label: calculate-estimates
+
+# Filter to government employees only (COW 3, 4, 5)
+gov_employees <- pums_all |>
+  dplyr::filter(!base::is.na(gov_level), earnings > 0)
+
+# Function to calculate weighted estimates by government level
+calc_gov_estimates <- function(data, cpi_tbl) {
+  
+  # Get replicate weight columns
+  pwgtp_cols <- base::grep("^PWGTP\\d+$", base::names(data), value = TRUE)
+  
+  results_list <- purrr::map(base::unique(data$year), function(y) {
+    year_data <- data[data$year == y, ]
+    cpi_factor <- cpi_tbl$factor_to_base[cpi_tbl$year == y]
+    if (base::length(cpi_factor) == 0L) cpi_factor <- 1
+    
+    # Create survey design
+    year_svy <- srvyr::as_survey_rep(
+      year_data,
+      weights = PWGTP,
+      repweights = dplyr::matches("^PWGTP\\d+$"),
+      type = "JK1",
+      scale = 4 / 80,
+      rscales = base::rep(1, 80),
+      mse = TRUE
+    )
+    
+    # Calculate stats by government level
+    stats <- year_svy |>
+      srvyr::group_by(gov_level) |>
+      srvyr::summarise(
+        n_employees = srvyr::survey_total(1, vartype = "se"),
+        mean_earnings = srvyr::survey_mean(earnings, vartype = "se"),
+        median_earnings = srvyr::survey_median(earnings, vartype = "se"),
+        .groups = "drop"
+      )
+    
+    stats$year <- y
+    stats$cpi_factor <- cpi_factor
+    stats$mean_earnings_real <- stats$mean_earnings * cpi_factor
+    stats$median_earnings_real <- stats$median_earnings * cpi_factor
+    
+    stats
+  })
+  
+  dplyr::bind_rows(results_list)
+}
+
+# Calculate estimates
+gov_results <- calc_gov_estimates(gov_employees, cpi_tbl)
+
+# Also calculate overall stats (all government combined)
+calc_overall_estimates <- function(data, cpi_tbl) {
+  
+  results_list <- purrr::map(base::unique(data$year), function(y) {
+    year_data <- data[data$year == y, ]
+    cpi_factor <- cpi_tbl$factor_to_base[cpi_tbl$year == y]
+    if (base::length(cpi_factor) == 0L) cpi_factor <- 1
+    
+    year_svy <- srvyr::as_survey_rep(
+      year_data,
+      weights = PWGTP,
+      repweights = dplyr::matches("^PWGTP\\d+$"),
+      type = "JK1",
+      scale = 4 / 80,
+      rscales = base::rep(1, 80),
+      mse = TRUE
+    )
+    
+    stats <- year_svy |>
+      srvyr::summarise(
+        n_employees = srvyr::survey_total(1, vartype = "se"),
+        mean_earnings = srvyr::survey_mean(earnings, vartype = "se"),
+        median_earnings = srvyr::survey_median(earnings, vartype = "se")
+      )
+    
+    stats$year <- y
+    stats$gov_level <- "All Government"
+    stats$cpi_factor <- cpi_factor
+    stats$mean_earnings_real <- stats$mean_earnings * cpi_factor
+    stats$median_earnings_real <- stats$median_earnings * cpi_factor
+    
+    stats
+  })
+  
+  dplyr::bind_rows(results_list)
+}
+
+overall_results <- calc_overall_estimates(gov_employees, cpi_tbl)
+```
+
+
+# Government Employee Counts
+
+Number of government employees (weighted) in the `r params$city` PUMA area.
+
+```{r}
+#| label: employee-counts-table
+
+counts_wide <- gov_results |>
+  dplyr::select(year, gov_level, n_employees) |>
+  tidyr::pivot_wider(
+    names_from = gov_level,
+    values_from = n_employees
+  ) |>
+  dplyr::arrange(year)
+
+# Add total
+counts_wide$Total <- base::rowSums(
+  counts_wide[, base::c("Local Government", "State Government", "Federal Government")],
+  na.rm = TRUE
+)
+
+counts_display <- counts_wide |>
+  dplyr::mutate(
+    Year = base::as.character(year),
+    Local = base::format(base::round(`Local Government`, 0), big.mark = ","),
+    State = base::format(base::round(`State Government`, 0), big.mark = ","),
+    Federal = base::format(base::round(`Federal Government`, 0), big.mark = ","),
+    Total = base::format(base::round(Total, 0), big.mark = ",")
+  ) |>
+  dplyr::select(Year, Local, State, Federal, Total)
+
+ft_counts <- flextable::flextable(counts_display)
+ft_counts <- ds_style_flextable(
+  ft_counts,
+  title = base::paste0("Government Employees: ", params$city, ", ", params$state, " Area")
+)
+ft_counts
+```
+
+```{r}
+#| label: employee-counts-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(gov_results, ggplot2::aes(x = year, y = n_employees, fill = gov_level)) +
+  ggplot2::geom_col(position = "dodge", width = 0.7) +
+  ggplot2::scale_x_continuous(breaks = base::unique(gov_results$year)) +
+  ggplot2::scale_y_continuous(
+    labels = function(x) base::format(x, big.mark = ",")
+  ) +
+  ggplot2::scale_fill_manual(
+    values = base::c(
+      "Local Government" = "steelblue",
+      "State Government" = "forestgreen",
+      "Federal Government" = "darkorange"
+    )
+  ) +
+  ggplot2::labs(
+    title = base::paste0("Government Employees by Level: ", params$city, ", ", params$state, " Area"),
+    subtitle = base::paste0("PUMS ", params$survey, " estimates"),
+    x = "Year",
+    y = "Number of Employees",
+    fill = "Level",
+    caption = "Source: ACS PUMS (weighted estimates)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    plot.title = ggplot2::element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+
+# Mean Earnings by Government Level
+
+Mean earnings for government employees (inflation-adjusted to `r params$base_year` dollars).
+
+```{r}
+#| label: mean-earnings-table
+
+mean_wide <- gov_results |>
+  dplyr::select(year, gov_level, mean_earnings_real) |>
+  tidyr::pivot_wider(
+    names_from = gov_level,
+    values_from = mean_earnings_real
+  ) |>
+  dplyr::arrange(year)
+
+mean_display <- mean_wide |>
+  dplyr::mutate(
+    Year = base::as.character(year),
+    Local = base::paste0("$", base::format(base::round(`Local Government`, 0), big.mark = ",")),
+    State = base::paste0("$", base::format(base::round(`State Government`, 0), big.mark = ",")),
+    Federal = base::paste0("$", base::format(base::round(`Federal Government`, 0), big.mark = ","))
+  ) |>
+  dplyr::select(Year, Local, State, Federal)
+
+ft_mean <- flextable::flextable(mean_display)
+ft_mean <- ds_style_flextable(
+  ft_mean,
+  title = base::paste0(
+    "Mean Earnings by Government Level: ", params$city, ", ", params$state,
+    " Area (", params$base_year, " dollars)"
+  )
+)
+ft_mean
+```
+
+```{r}
+#| label: mean-earnings-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(gov_results, ggplot2::aes(x = year, y = mean_earnings_real, color = gov_level)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_x_continuous(breaks = base::unique(gov_results$year)) +
+  ggplot2::scale_y_continuous(
+    labels = function(x) base::paste0("$", base::format(x, big.mark = ","))
+  ) +
+  ggplot2::scale_color_manual(
+    values = base::c(
+      "Local Government" = "steelblue",
+      "State Government" = "forestgreen",
+      "Federal Government" = "darkorange"
+    )
+  ) +
+  ggplot2::labs(
+    title = base::paste0("Mean Earnings by Government Level: ", params$city, ", ", params$state, " Area"),
+    subtitle = base::paste0("PUMS ", params$survey, " (", params$base_year, " dollars)"),
+    x = "Year",
+    y = "Mean Earnings",
+    color = "Level",
+    caption = "Source: ACS PUMS (weighted estimates)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    plot.title = ggplot2::element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+
+# Median Earnings by Government Level
+
+Median earnings for government employees (inflation-adjusted to `r params$base_year` dollars).
+
+```{r}
+#| label: median-earnings-table
+
+median_wide <- gov_results |>
+  dplyr::select(year, gov_level, median_earnings_real) |>
+  tidyr::pivot_wider(
+    names_from = gov_level,
+    values_from = median_earnings_real
+  ) |>
+  dplyr::arrange(year)
+
+median_display <- median_wide |>
+  dplyr::mutate(
+    Year = base::as.character(year),
+    Local = base::paste0("$", base::format(base::round(`Local Government`, 0), big.mark = ",")),
+    State = base::paste0("$", base::format(base::round(`State Government`, 0), big.mark = ",")),
+    Federal = base::paste0("$", base::format(base::round(`Federal Government`, 0), big.mark = ","))
+  ) |>
+  dplyr::select(Year, Local, State, Federal)
+
+ft_median <- flextable::flextable(median_display)
+ft_median <- ds_style_flextable(
+  ft_median,
+  title = base::paste0(
+    "Median Earnings by Government Level: ", params$city, ", ", params$state,
+    " Area (", params$base_year, " dollars)"
+  )
+)
+ft_median
+```
+
+```{r}
+#| label: median-earnings-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(gov_results, ggplot2::aes(x = year, y = median_earnings_real, color = gov_level)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_x_continuous(breaks = base::unique(gov_results$year)) +
+  ggplot2::scale_y_continuous(
+    labels = function(x) base::paste0("$", base::format(x, big.mark = ","))
+  ) +
+  ggplot2::scale_color_manual(
+    values = base::c(
+      "Local Government" = "steelblue",
+      "State Government" = "forestgreen",
+      "Federal Government" = "darkorange"
+    )
+  ) +
+  ggplot2::labs(
+    title = base::paste0("Median Earnings by Government Level: ", params$city, ", ", params$state, " Area"),
+    subtitle = base::paste0("PUMS ", params$survey, " (", params$base_year, " dollars)"),
+    x = "Year",
+    y = "Median Earnings",
+    color = "Level",
+    caption = "Source: ACS PUMS (weighted estimates)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    plot.title = ggplot2::element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+
+# Latest Year Comparison
+
+Detailed comparison for `r base::max(params$years)`:
+
+```{r}
+#| label: latest-year-comparison
+
+latest_year <- base::max(gov_results$year)
+latest_data <- gov_results |>
+  dplyr::filter(year == latest_year) |>
+  dplyr::arrange(dplyr::desc(mean_earnings_real))
+
+latest_display <- latest_data |>
+  dplyr::mutate(
+    `Government Level` = gov_level,
+    Employees = base::format(base::round(n_employees, 0), big.mark = ","),
+    `Mean Earnings` = base::paste0(
+      "$", base::format(base::round(mean_earnings_real, 0), big.mark = ",")
+    ),
+    `Median Earnings` = base::paste0(
+      "$", base::format(base::round(median_earnings_real, 0), big.mark = ",")
+    )
+  ) |>
+  dplyr::select(`Government Level`, Employees, `Mean Earnings`, `Median Earnings`)
+
+ft_latest <- flextable::flextable(latest_display)
+ft_latest <- ds_style_flextable(
+  ft_latest,
+  title = base::paste0(
+    "Government Employee Earnings (", latest_year, "): ",
+    params$city, ", ", params$state, " Area"
+  )
+)
+ft_latest
+```
+
+
+# All Government Combined
+
+Overall statistics for all government employees (local + state + federal combined).
+
+```{r}
+#| label: overall-table
+
+overall_display <- overall_results |>
+  dplyr::arrange(year) |>
+  dplyr::mutate(
+    Year = base::as.character(year),
+    Employees = base::format(base::round(n_employees, 0), big.mark = ","),
+    `Mean (Real)` = base::paste0(
+      "$", base::format(base::round(mean_earnings_real, 0), big.mark = ",")
+    ),
+    `Median (Real)` = base::paste0(
+      "$", base::format(base::round(median_earnings_real, 0), big.mark = ",")
+    )
+  ) |>
+  dplyr::select(Year, Employees, `Mean (Real)`, `Median (Real)`)
+
+ft_overall <- flextable::flextable(overall_display)
+ft_overall <- ds_style_flextable(
+  ft_overall,
+  title = base::paste0(
+    "All Government Employees: ", params$city, ", ", params$state,
+    " Area (", params$base_year, " dollars)"
+  )
+)
+ft_overall
+```
+
+
+# Export Data
+
+```{r}
+#| label: export
+
+# Create output directory
+base::dir.create("out", showWarnings = FALSE, recursive = TRUE)
+
+# File base name
+file_base <- base::paste0(
+  "out/pums_gov_earnings_",
+  base::tolower(base::gsub(" ", "_", params$city)), "_",
+  params$state, "_",
+  base::min(params$years), "_", base::max(params$years)
+)
+
+# Save results as RDS
+base::saveRDS(gov_results, base::paste0(file_base, "_by_level.rds"))
+base::saveRDS(overall_results, base::paste0(file_base, "_overall.rds"))
+
+# Save as CSV
+readr::write_csv(gov_results, base::paste0(file_base, "_by_level.csv"))
+readr::write_csv(overall_results, base::paste0(file_base, "_overall.csv"))
+
+# Save as Excel
+writexl::write_xlsx(
+  base::list(
+    by_government_level = gov_results,
+    all_government = overall_results,
+    inflation_rate = inflation_rate,
+    cpi_factors = cpi_tbl
+  ),
+  base::paste0(file_base, ".xlsx")
+)
+```
+
+Data exported to `out/` directory:
+
+- **By level**: `r base::paste0(file_base, "_by_level.rds")` / `.csv`
+- **Overall**: `r base::paste0(file_base, "_overall.rds")` / `.csv`
+- **Excel**: `r base::paste0(file_base, ".xlsx")` (4 sheets)
+
+
+# Using This Template
+
+To analyze a different city, change these values in the `params` code chunk:
+
+```r
+params <- base::list(
+  city       = "Austin",
+  state      = "TX",
+  years      = 2019:2023,
+  min_age    = 20L,
+  survey     = "acs5",
+  base_year  = 2023,
+  cache_dir  = "cache/pums_gov"
+)
+```
+
+Clear cache when changing cities:
+
+```r
+unlink("cache", recursive = TRUE)
+```
+
+
+# Notes
+
+**Class of Worker (COW) Variable:**
+
+| Code | Description |
+|------|-------------|
+| 1 | Private for-profit employee |
+| 2 | Private not-for-profit employee |
+| 3 | Local government employee |
+| 4 | State government employee |
+| 5 | Federal government employee |
+| 6 | Self-employed (incorporated) |
+| 7 | Self-employed (not incorporated) |
+| 8 | Working without pay in family business |
+| 9 | Unemployed, never worked |
+
+**Definitions:**
+
+- **Mean Earnings**: Average of wages + self-employment income among employees
+- **Median Earnings**: Middle value of earnings
+- **Employees**: Weighted count from PUMS person weights
+
+**Caveats:**
+
+- Data represents the PUMA area, not just the city
+- Government employees may live in one area but work elsewhere
+- COW reflects current or most recent job in past 5 years
+- Small sample sizes for some government levels may result in large standard errors

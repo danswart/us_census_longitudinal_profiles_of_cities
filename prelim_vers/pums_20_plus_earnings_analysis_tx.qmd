@@ -1,0 +1,741 @@
+---
+title: "Per Capita Earnings Analysis (PUMS Microdata)"
+subtitle: "Adults 20+ with Earnings"
+author: "Dan"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: params
+#| include: false
+
+# =============================================================================
+# PARAMETERS - CHANGE THESE FOR A DIFFERENT STATE/YEARS
+# =============================================================================
+
+params <- base::list(
+  # NOTE: PUMS data is only available at state and PUMA level, not city level.
+  # PUMAs are areas of ~100k+ people. For city-level analysis, you'd need to
+
+  # identify which PUMA(s) contain your city and filter accordingly.
+  state      = "TX",
+  puma       = NULL,
+  years      = 2019:2023,
+  min_age    = 20L,
+  survey     = "acs5",
+  base_year  = 2023,
+  cache_dir  = "cache/pums"
+)
+
+# =============================================================================
+# To find PUMAs for a specific city, see:
+# https://www.census.gov/programs-surveys/geography/guidance/geo-areas/pumas.html
+# Or use tigris::pumas(state = "TX") to get PUMA boundaries
+# =============================================================================
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+# -----------------------------------------------------------------------------
+# Package verification
+# -----------------------------------------------------------------------------
+required_pkgs <- c(
+"tidycensus", "tigris", "dplyr", "purrr", "tibble", "stringr", "tidyr",
+"digest", "lubridate", "quantmod", "zoo", "ggplot2", "flextable",
+"srvyr", "survey", "readr", "writexl"
+)
+
+missing <- required_pkgs[
+!base::vapply(required_pkgs, requireNamespace, logical(1L), quietly = TRUE)
+]
+
+if (base::length(missing) > 0L) {
+base::stop("Install missing packages:\n", base::paste(missing, collapse = ", "))
+}
+
+# -----------------------------------------------------------------------------
+# Options
+# -----------------------------------------------------------------------------
+base::options(
+tigris_use_cache = TRUE,
+survey.lonely.psu = "adjust"
+)
+```
+
+```{r}
+#| label: helper-functions
+#| include: false
+
+# -----------------------------------------------------------------------------
+# Caching utilities
+# -----------------------------------------------------------------------------
+
+ds_cache_path <- function(cache_dir, key, ext = "rds") {
+base::dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+base::file.path(cache_dir, base::paste0(key, ".", ext))
+}
+
+ds_cache_key <- function(prefix, params) {
+digest::digest(base::list(prefix = prefix, params = params), algo = "xxhash64")
+}
+
+ds_cache_read <- function(path) {
+if (base::file.exists(path)) base::readRDS(path) else NULL
+}
+
+ds_cache_write <- function(x, path) {
+base::dir.create(base::dirname(path), showWarnings = FALSE, recursive = TRUE)
+base::saveRDS(x, path)
+base::invisible(x)
+}
+
+# -----------------------------------------------------------------------------
+# PUMS data retrieval with caching
+# -----------------------------------------------------------------------------
+
+ds_get_pums_earnings <- function(state, puma = NULL, year, min_age = 20L,
+                                 survey = "acs5", cache_dir) {
+  key <- ds_cache_key("pums_earnings", base::list(
+    state = state, puma = puma, year = year, min_age = min_age, survey = survey
+  ))
+  path <- ds_cache_path(cache_dir, key)
+  cached <- ds_cache_read(path)
+  if (!base::is.null(cached)) return(cached)
+  
+  # PUMS variables:
+  # AGEP = Age
+  # WAGP = Wages/salary income
+  # SEMP = Self-employment income
+  # PINCP = Total person income
+  # PERNP = Total person earnings (available in some years)
+  # PWGTP = Person weight
+  # PUMA = Public Use Microdata Area
+  
+  pums_vars <- base::c("AGEP", "WAGP", "SEMP", "PINCP", "PUMA")
+  
+  # Build filter for age
+  age_filter <- base::list(AGEP = min_age:99L)
+  
+  raw <- tidycensus::get_pums(
+    variables        = pums_vars,
+    state            = state,
+    puma             = puma,
+    year             = year,
+    survey           = survey,
+    variables_filter = age_filter,
+    rep_weights      = "person"
+  )
+  
+  # Calculate total earnings (wages + self-employment)
+  raw$earnings <- base::as.numeric(raw$WAGP) + base::as.numeric(raw$SEMP)
+  raw$earnings <- base::ifelse(raw$earnings < 0, 0, raw$earnings)
+  
+  # Add year column
+
+  raw$year <- year
+  
+  ds_cache_write(raw, path)
+}
+
+# -----------------------------------------------------------------------------
+# CPI / Inflation
+# -----------------------------------------------------------------------------
+
+ds_get_cpi_annual <- function(start_year, end_year, base_year, cache_dir) {
+key <- ds_cache_key("cpi_annual", base::list(
+  start_year = start_year, end_year = end_year, base_year = base_year
+))
+path <- ds_cache_path(cache_dir, key)
+cached <- ds_cache_read(path)
+if (!base::is.null(cached)) return(cached)
+
+xt <- quantmod::getSymbols("CPIAUCSL", src = "FRED", auto.assign = FALSE)
+df <- tibble::tibble(
+  date = base::as.Date(zoo::index(xt)),
+  cpi  = base::as.numeric(xt[, 1L])
+)
+df$year <- lubridate::year(df$date)
+df <- df[df$year >= start_year & df$year <= end_year, ]
+
+annual <- dplyr::summarise(
+  dplyr::group_by(df, year),
+  cpi_annual_avg = base::mean(cpi, na.rm = TRUE),
+  .groups = "drop"
+)
+
+base_cpi <- annual$cpi_annual_avg[annual$year == base_year]
+if (base::length(base_cpi) != 1L) {
+  base::stop("Base year CPI not found for year ", base_year)
+}
+
+annual$base_year <- base_year
+annual$factor_to_base <- base_cpi / annual$cpi_annual_avg
+
+ds_cache_write(annual, path)
+}
+
+# -----------------------------------------------------------------------------
+# Flextable styling
+# -----------------------------------------------------------------------------
+
+ds_style_flextable <- function(ft, title = NULL) {
+if (!base::is.null(title)) {
+  ft <- flextable::add_header_lines(ft, values = title)
+  ft <- flextable::color(ft, i = 1, part = "header", color = "blue")
+  ft <- flextable::italic(ft, i = 1, part = "header")
+  ft <- flextable::align(ft, i = 1, part = "header", align = "left")
+  ft <- flextable::fontsize(ft, i = 1, part = "header", size = 12)
+  ft <- flextable::bg(ft, i = 1, part = "header", bg = "white")
+  ft <- flextable::bg(ft, i = 2, part = "header", bg = "palegreen")
+} else {
+  ft <- flextable::bg(ft, i = 1, part = "header", bg = "palegreen")
+}
+ft <- flextable::autofit(ft)
+ft
+}
+```
+
+# Overview
+
+This document calculates earnings statistics for **adults `r params$min_age`+ with earnings** in **`r params$state`** using American Community Survey Public Use Microdata Sample (PUMS) data.
+
+**Key difference from aggregate ACS tables:**
+
+- PUMS microdata allows filtering to **exactly the population you want** (age 20+, with earnings)
+- Weighted estimates account for survey design
+- Standard errors calculated using replicate weights
+
+**Variables used:**
+
+| Variable | Description |
+|----------|-------------|
+| AGEP | Age |
+| WAGP | Wages/salary income past 12 months |
+| SEMP | Self-employment income past 12 months |
+| PINCP | Total person income |
+| PWGTP | Person weight (for weighted estimates) |
+
+**Calculated measure:**
+
+- **Earnings** = WAGP + SEMP (wages plus self-employment income)
+
+**Important limitation:** PUMS data is only available at state and PUMA level, not city level. PUMAs are areas with ~100,000+ people. To analyze a specific city, you would need to identify which PUMA(s) contain that city.
+
+
+# Data Retrieval
+
+```{r}
+#| label: pull-pums
+#| echo: false
+
+
+# Pull PUMS data for each year
+pums_list <- purrr::map(params$years, function(y) {
+tryCatch({
+  ds_get_pums_earnings(
+    state     = params$state,
+    puma      = params$puma,
+    year      = y,
+    min_age   = params$min_age,
+    survey    = params$survey,
+    cache_dir = params$cache_dir
+  )
+}, error = function(e) {
+  base::warning("Failed to get PUMS for year ", y, ": ", e$message)
+  NULL
+})
+})
+
+# Remove failed years
+pums_list <- pums_list[!base::vapply(pums_list, base::is.null, logical(1L))]
+
+# Combine all years
+pums_all <- dplyr::bind_rows(pums_list)
+```
+
+```{r}
+#| label: cpi-data
+
+# Get CPI for inflation adjustment
+cpi_tbl <- ds_get_cpi_annual(
+start_year = base::min(params$years),
+end_year   = base::max(params$years),
+base_year  = params$base_year,
+cache_dir  = params$cache_dir
+)
+
+# Create inflation rate data frame
+inflation_rate <- cpi_tbl |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  cpi_prior = dplyr::lag(cpi_annual_avg),
+  inflation_pct = (cpi_annual_avg - cpi_prior) / cpi_prior * 100
+) |>
+dplyr::filter(!base::is.na(inflation_pct)) |>
+dplyr::select(year, cpi_annual_avg, inflation_pct)
+```
+
+```{r}
+#| label: calculate-estimates
+
+# Function to calculate weighted estimates for a single year
+calc_year_estimates <- function(pums_year, cpi_factor) {
+  
+  # Filter to those with positive earnings
+  earners <- pums_year |>
+    dplyr::filter(earnings > 0)
+  
+  if (base::nrow(earners) == 0L) {
+    return(tibble::tibble(
+      year = base::unique(pums_year$year),
+      n_earners = 0L,
+      mean_earnings = NA_real_,
+      mean_earnings_se = NA_real_,
+      median_earnings = NA_real_,
+      median_earnings_se = NA_real_,
+      total_earnings = NA_real_,
+      total_pop = NA_real_,
+      per_capita_earnings = NA_real_
+    ))
+  }
+  
+  # Get replicate weight columns
+  pwgtp_cols <- base::grep("^PWGTP\\d+$", base::names(earners), value = TRUE)
+  
+  # Create survey design object with replicate weights
+  earners_svy <- srvyr::as_survey_rep(
+    earners,
+    weights = PWGTP,
+    repweights = dplyr::matches("^PWGTP\\d+$"),
+    type = "JK1",
+    scale = 4 / 80,
+    rscales = base::rep(1, 80),
+    mse = TRUE
+  )
+  
+  # Calculate weighted statistics
+  stats <- earners_svy |>
+    srvyr::summarise(
+      n_earners = srvyr::survey_total(1, vartype = "se"),
+      mean_earnings = srvyr::survey_mean(earnings, vartype = "se"),
+      median_earnings = srvyr::survey_median(earnings, vartype = "se"),
+      total_earnings = srvyr::survey_total(earnings, vartype = "se")
+    )
+  
+  # Also get total population 20+ (including non-earners) for per capita
+  all_svy <- srvyr::as_survey_rep(
+    pums_year,
+    weights = PWGTP,
+    repweights = dplyr::matches("^PWGTP\\d+$"),
+    type = "JK1",
+    scale = 4 / 80,
+    rscales = base::rep(1, 80),
+    mse = TRUE
+  )
+  
+  pop_stats <- all_svy |>
+    srvyr::summarise(
+      total_pop = srvyr::survey_total(1, vartype = "se")
+    )
+  
+  tibble::tibble(
+    year = base::unique(pums_year$year),
+    n_earners = stats$n_earners,
+    n_earners_se = stats$n_earners_se,
+    mean_earnings = stats$mean_earnings,
+    mean_earnings_se = stats$mean_earnings_se,
+    median_earnings = stats$median_earnings,
+    median_earnings_se = stats$median_earnings_se,
+    total_earnings = stats$total_earnings,
+    total_earnings_se = stats$total_earnings_se,
+    total_pop = pop_stats$total_pop,
+    total_pop_se = pop_stats$total_pop_se,
+    per_capita_earnings = stats$total_earnings / pop_stats$total_pop,
+    cpi_factor = cpi_factor
+  )
+}
+
+# Calculate estimates for each year
+results_list <- purrr::map(base::unique(pums_all$year), function(y) {
+pums_year <- pums_all[pums_all$year == y, ]
+cpi_factor <- cpi_tbl$factor_to_base[cpi_tbl$year == y]
+if (base::length(cpi_factor) == 0L) cpi_factor <- 1
+calc_year_estimates(pums_year, cpi_factor)
+})
+
+# Combine results
+results <- dplyr::bind_rows(results_list) |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  # Calculate real (inflation-adjusted) values
+  mean_earnings_real = mean_earnings * cpi_factor,
+  median_earnings_real = median_earnings * cpi_factor,
+  per_capita_earnings_real = per_capita_earnings * cpi_factor
+)
+```
+
+
+# Per Capita Earnings (Adults `r params$min_age`+)
+  
+Total earnings of adults `r params$min_age`+ with earnings, divided by total population `r params$min_age`+.
+
+```{r}
+#| label: per-capita-table
+
+pce_display <- results |>
+dplyr::mutate(
+  Year = base::as.character(year),
+  `Pop 20+` = base::format(base::round(total_pop, 0), big.mark = ","),
+  Earners = base::format(base::round(n_earners, 0), big.mark = ","),
+  `Per Capita (Nominal)` = base::paste0(
+    "$", base::format(base::round(per_capita_earnings, 0), big.mark = ",")
+  ),
+  `Per Capita (Real)` = base::paste0(
+    "$", base::format(base::round(per_capita_earnings_real, 0), big.mark = ",")
+  )
+) |>
+dplyr::select(Year, `Pop 20+`, Earners, `Per Capita (Nominal)`, `Per Capita (Real)`)
+
+ft_pce <- flextable::flextable(pce_display)
+ft_pce <- ds_style_flextable(
+ft_pce,
+title = base::paste0(
+  "Per Capita Earnings: ", params$state, " Adults ", params$min_age,
+  "+ (Real values in ", params$base_year, " dollars)"
+)
+)
+ft_pce
+```
+
+```{r}
+#| label: per-capita-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(results, ggplot2::aes(x = year, y = per_capita_earnings_real)) +
+ggplot2::geom_line(color = "blue", linewidth = 1) +
+ggplot2::geom_point(color = "blue", size = 3) +
+ggplot2::scale_x_continuous(breaks = results$year) +
+ggplot2::scale_y_continuous(
+  labels = function(x) base::paste0("$", base::format(x, big.mark = ","))
+) +
+ggplot2::labs(
+  title = base::paste0("Per Capita Earnings: ", params$state, " Adults ", params$min_age, "+"),
+  subtitle = base::paste0("PUMS ", params$survey, " (", params$base_year, " dollars)"),
+  x = "Year",
+  y = "Per Capita Earnings",
+  caption = "Total earnings of earners / Total population 20+. Source: ACS PUMS"
+) +
+ggplot2::theme_minimal(base_size = 12) +
+ggplot2::theme(
+  axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+  plot.title = ggplot2::element_text(face = "bold")
+)
+```
+
+
+# Mean Earnings (Adults `r params$min_age`+ with Earnings)
+
+Average earnings among adults `r params$min_age`+ who had positive earnings.
+
+```{r}
+#| label: mean-earnings-table
+
+mean_display <- results |>
+dplyr::mutate(
+  Year = base::as.character(year),
+  Earners = base::format(base::round(n_earners, 0), big.mark = ","),
+  `Mean (Nominal)` = base::paste0(
+    "$", base::format(base::round(mean_earnings, 0), big.mark = ",")
+  ),
+  `Mean (Real)` = base::paste0(
+    "$", base::format(base::round(mean_earnings_real, 0), big.mark = ",")
+  ),
+  `Std Error` = base::paste0(
+    "\u00b1$", base::format(base::round(mean_earnings_se, 0), big.mark = ",")
+  )
+) |>
+dplyr::select(Year, Earners, `Mean (Nominal)`, `Mean (Real)`, `Std Error`)
+
+ft_mean <- flextable::flextable(mean_display)
+ft_mean <- ds_style_flextable(
+ft_mean,
+title = base::paste0(
+  "Mean Earnings: ", params$state, " Adults ", params$min_age,
+  "+ with Earnings (", params$base_year, " dollars)"
+)
+)
+ft_mean
+```
+
+```{r}
+#| label: mean-earnings-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(results, ggplot2::aes(x = year)) +
+ggplot2::geom_ribbon(
+  ggplot2::aes(
+    ymin = mean_earnings_real - (mean_earnings_se * cpi_factor),
+    ymax = mean_earnings_real + (mean_earnings_se * cpi_factor)
+  ),
+  fill = "lightgreen",
+  alpha = 0.5
+) +
+ggplot2::geom_line(ggplot2::aes(y = mean_earnings_real), color = "darkgreen", linewidth = 1) +
+ggplot2::geom_point(ggplot2::aes(y = mean_earnings_real), color = "darkgreen", size = 3) +
+ggplot2::scale_x_continuous(breaks = results$year) +
+ggplot2::scale_y_continuous(
+  labels = function(x) base::paste0("$", base::format(x, big.mark = ","))
+) +
+ggplot2::labs(
+  title = base::paste0("Mean Earnings: ", params$state, " Adults ", params$min_age, "+ with Earnings"),
+  subtitle = base::paste0("PUMS ", params$survey, " (", params$base_year, " dollars)"),
+  x = "Year",
+  y = "Mean Earnings",
+  caption = "Shaded area represents standard error. Source: ACS PUMS"
+) +
+ggplot2::theme_minimal(base_size = 12) +
+ggplot2::theme(
+  axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+  plot.title = ggplot2::element_text(face = "bold")
+)
+```
+
+
+# Median Earnings (Adults `r params$min_age`+ with Earnings)
+
+Median earnings among adults `r params$min_age`+ who had positive earnings.
+
+```{r}
+#| label: median-earnings-table
+
+median_display <- results |>
+dplyr::mutate(
+  Year = base::as.character(year),
+  Earners = base::format(base::round(n_earners, 0), big.mark = ","),
+  `Median (Nominal)` = base::paste0(
+    "$", base::format(base::round(median_earnings, 0), big.mark = ",")
+  ),
+  `Median (Real)` = base::paste0(
+    "$", base::format(base::round(median_earnings_real, 0), big.mark = ",")
+  ),
+  `Std Error` = base::paste0(
+    "\u00b1$", base::format(base::round(median_earnings_se, 0), big.mark = ",")
+  )
+) |>
+dplyr::select(Year, Earners, `Median (Nominal)`, `Median (Real)`, `Std Error`)
+
+ft_median <- flextable::flextable(median_display)
+ft_median <- ds_style_flextable(
+ft_median,
+title = base::paste0(
+  "Median Earnings: ", params$state, " Adults ", params$min_age,
+  "+ with Earnings (", params$base_year, " dollars)"
+)
+)
+ft_median
+```
+
+```{r}
+#| label: median-earnings-chart
+#| fig-width: 9
+#| fig-height: 5
+
+ggplot2::ggplot(results, ggplot2::aes(x = year)) +
+ggplot2::geom_ribbon(
+  ggplot2::aes(
+    ymin = median_earnings_real - (median_earnings_se * cpi_factor),
+    ymax = median_earnings_real + (median_earnings_se * cpi_factor)
+  ),
+  fill = "lightyellow",
+  alpha = 0.7
+) +
+ggplot2::geom_line(ggplot2::aes(y = median_earnings_real), color = "darkorange", linewidth = 1) +
+ggplot2::geom_point(ggplot2::aes(y = median_earnings_real), color = "darkorange", size = 3) +
+ggplot2::scale_x_continuous(breaks = results$year) +
+ggplot2::scale_y_continuous(
+  labels = function(x) base::paste0("$", base::format(x, big.mark = ","))
+) +
+ggplot2::labs(
+  title = base::paste0("Median Earnings: ", params$state, " Adults ", params$min_age, "+ with Earnings"),
+  subtitle = base::paste0("PUMS ", params$survey, " (", params$base_year, " dollars)"),
+  x = "Year",
+  y = "Median Earnings",
+  caption = "Shaded area represents standard error. Source: ACS PUMS"
+) +
+ggplot2::theme_minimal(base_size = 12) +
+ggplot2::theme(
+  axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+  plot.title = ggplot2::element_text(face = "bold")
+)
+```
+
+
+# Summary Comparison
+
+All measures side-by-side (inflation-adjusted to `r params$base_year` dollars).
+
+```{r}
+#| label: comparison-table
+
+comparison <- results |>
+dplyr::mutate(
+  Year = base::as.character(year),
+  `Per Capita` = base::paste0(
+    "$", base::format(base::round(per_capita_earnings_real, 0), big.mark = ",")
+  ),
+  `Mean` = base::paste0(
+    "$", base::format(base::round(mean_earnings_real, 0), big.mark = ",")
+  ),
+  `Median` = base::paste0(
+    "$", base::format(base::round(median_earnings_real, 0), big.mark = ",")
+  )
+) |>
+dplyr::select(Year, `Per Capita`, Mean, Median)
+
+ft_comp <- flextable::flextable(comparison)
+ft_comp <- ds_style_flextable(
+ft_comp,
+title = base::paste0(
+  "Earnings Comparison: ", params$state, " Adults ", params$min_age,
+  "+ (", params$base_year, " dollars)"
+)
+)
+ft_comp
+```
+
+
+# Annual Inflation Rate
+
+```{r}
+#| label: inflation-table
+
+inflation_display <- inflation_rate |>
+dplyr::arrange(year) |>
+dplyr::mutate(
+  Year = base::as.character(year),
+  `Inflation Rate` = base::paste0(
+    base::format(base::round(inflation_pct, 1), nsmall = 1), "%"
+  )
+) |>
+dplyr::select(Year, `Inflation Rate`)
+
+ft_inflation <- flextable::flextable(inflation_display)
+ft_inflation <- ds_style_flextable(ft_inflation, title = "Annual Inflation Rate (CPI-U)")
+ft_inflation
+```
+
+
+# Export Data
+
+```{r}
+#| label: export
+
+# # Create output directory
+# base::dir.create("out", showWarnings = FALSE, recursive = TRUE)
+# 
+# # File base name
+# file_base <- base::paste0(
+# "out/pums_earnings_",
+# params$state, "_age", params$min_age, "plus_",
+# base::min(params$years), "_", base::max(params$years)
+# )
+# 
+# # Save results as RDS
+# base::saveRDS(results, base::paste0(file_base, ".rds"))
+# 
+# # Save inflation rate
+# base::saveRDS(inflation_rate, base::paste0(file_base, "_inflation_rate.rds"))
+# 
+# # Save as CSV
+# readr::write_csv(results, base::paste0(file_base, ".csv"))
+# readr::write_csv(inflation_rate, base::paste0(file_base, "_inflation_rate.csv"))
+# 
+# # Save as Excel (multiple sheets)
+# writexl::write_xlsx(
+# base::list(
+#   earnings_summary = results,
+#   inflation_rate = inflation_rate,
+#   cpi_factors = cpi_tbl
+# ),
+# base::paste0(file_base, ".xlsx")
+# )
+```
+
+Data exported to `out/` directory:
+
+- **RDS**: `r base::paste0(file_base, ".rds")`
+- **CSV**: `r base::paste0(file_base, ".csv")`
+- **Excel**: `r base::paste0(file_base, ".xlsx")` (3 sheets)
+
+
+# Using This Template
+
+To analyze a different state or age group, change these values in the `params` code chunk:
+
+```r
+params <- base::list(
+  state      = "CA",
+  puma       = NULL,
+  years      = 2019:2023,
+  min_age    = 25L,
+  survey     = "acs5",
+  base_year  = 2023,
+  cache_dir  = "cache/pums"
+)
+```
+
+Clear cache when changing parameters:
+
+```r
+unlink("cache", recursive = TRUE)
+```
+
+
+# Notes
+
+**Geography Limitation:**
+
+- PUMS data is only available at **state** and **PUMA** level
+- PUMAs are areas of ~100,000+ people
+- City-level data is **not directly available** from PUMS
+- To approximate a city, identify which PUMA(s) contain it:
+
+```r
+# Get PUMA boundaries for Texas
+tx_pumas <- tigris::pumas(state = "TX", year = 2020)
+
+# Find PUMA containing a city (requires city boundary shapefile)
+```
+
+**Definitions:**
+
+- **Per Capita Earnings**: Total earnings of all earners `r params$min_age`+ divided by total population `r params$min_age`+
+- **Mean Earnings**: Average earnings among those with positive earnings
+- **Median Earnings**: Middle value of earnings among those with positive earnings
+- **Earnings**: Wages/salary (WAGP) + Self-employment income (SEMP)
+
+**Survey Design:**
+
+- Estimates use person weights (PWGTP)
+- Standard errors calculated using replicate weights (80 replicate weights with JK1 method)
+- This properly accounts for the complex survey design
+
+**ACS 5-Year vs 1-Year:**
+
+- 5-year estimates (default) have smaller margins of error but reflect 5-year averages
+- 1-year estimates are more current but less precise
+- 2020 1-year data is not available due to COVID-related data collection issues
