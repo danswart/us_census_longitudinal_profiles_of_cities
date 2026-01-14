@@ -1,0 +1,312 @@
+# Distribution Evolution Analysis
+
+This section examines how earnings distributions shift over time—not just the averages, but the entire shape and spread.
+
+```{r}
+#| label: load-distrib-functions
+#| include: false
+
+# Source distribution evolution functions
+source("R/distrib_ridge.R")
+source("R/distrib_quantile_evolution.R")
+source("R/distrib_acceleration.R")
+
+# Ensure ggridges is available
+if (!requireNamespace("ggridges", quietly = TRUE)) {
+  stop("Install ggridges: install.packages('ggridges')")
+}
+```
+
+
+## Ridge Plots: Watching the Distribution Walk
+
+Ridge plots stack each year's density curve vertically, letting you see the entire distribution shift over time. The vertical line within each ridge marks the median.
+
+```{r}
+#| label: ridge-all-gov
+#| fig-width: 11
+#| fig-height: 7
+
+# All government employees combined
+distrib_ridge(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ title = "All Government Employees: Earnings Distribution Shift"
+)
+```
+
+```{r}
+#| label: ridge-by-gov-level
+#| fig-width: 11
+#| fig-height: 12
+
+# Faceted by government level
+distrib_ridge(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ group_col = "gov_level",
+ title = "Earnings Distribution Shift by Government Level"
+)
+```
+
+**What to look for:**
+
+- **Rightward march**: Distribution shifting toward higher earnings
+- **Shape changes**: Getting wider (more variance) or narrower (compression)
+- **Tail behavior**: Right tail stretching (high earners pulling away) or compressing
+
+
+## Quantile Evolution: Who's Moving and How Fast?
+
+This plot tracks the 10th, 25th, 50th (median), 75th, and 90th percentiles over time. It reveals whether the whole distribution moves together or if certain segments are outpacing others.
+
+```{r}
+#| label: quantile-all-gov
+#| fig-width: 10
+#| fig-height: 6
+
+# All government employees
+distrib_quantile_evolution(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ title = "All Government: Percentile Evolution"
+)
+```
+
+```{r}
+#| label: quantile-by-gov-level
+#| fig-width: 12
+#| fig-height: 8
+
+# By government level
+distrib_quantile_evolution(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ group_col = "gov_level",
+ title = "Percentile Evolution by Government Level"
+)
+```
+
+**Interpretation guide:**
+
+| Pattern | Meaning |
+|---------|---------|
+| Parallel lines | Uniform shift—everyone moves together |
+| Diverging lines (fan out) | Inequality growth—top pulling away from bottom |
+| Converging lines | Compression—distribution tightening |
+| P90 rising faster than P50 | Top earners gaining disproportionately |
+| P10 flat while others rise | Bottom earners being left behind |
+
+
+## Acceleration Analysis: Rate of Change and Its Change
+
+This table quantifies what the plots show visually: year-over-year percent changes, acceleration (is growth speeding up or slowing down?), and inequality measures.
+
+```{r}
+#| label: acceleration-all-gov
+
+# All government combined
+accel_all <- distrib_acceleration(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ title = "All Government Employees: Earnings Change & Acceleration"
+)
+
+accel_all$table
+```
+
+```{r}
+#| label: acceleration-by-gov-level
+
+# By government level
+accel_by_level <- distrib_acceleration(
+ data = derived_gov_employees,
+ value_col = "earnings",
+ year_col = "year",
+ group_col = "gov_level",
+ title = "Earnings Change & Acceleration by Government Level"
+)
+
+accel_by_level$table
+```
+
+**Column definitions:**
+
+| Column | What it measures |
+|--------|------------------|
+| **Mean Δ%** | Year-over-year percent change in mean earnings |
+| **Accel** | Change in the percent change (in percentage points). Positive = growth accelerating, negative = decelerating |
+| **90/10** | Ratio of 90th percentile to 10th percentile. Higher = more inequality |
+| **90/10 Δ** | Change in the 90/10 ratio. Positive = inequality growing |
+
+**Example interpretation:**
+
+- `Mean Δ%` = +4.2% means average earnings rose 4.2% from prior year
+- `Accel` = +1.5pp means this year's growth rate is 1.5 percentage points *faster* than last year's
+- `90/10` = 3.5 means the 90th percentile earns 3.5× what the 10th percentile earns
+- `90/10 Δ` = +0.2 means that ratio increased by 0.2 (inequality widened)
+
+
+## Year-over-Year Comparison: Individual Distributions
+
+For detailed inspection, here are the weighted distributions for each year overlaid on a single plot per government level.
+
+```{r}
+#| label: overlay-local
+#| fig-width: 10
+#| fig-height: 6
+
+# Local Government - all years overlaid (weighted)
+local_all_years <- derived_gov_employees |>
+ dplyr::filter(gov_level == "Local Government")
+
+ggplot2::ggplot(local_all_years, ggplot2::aes(x = earnings, fill = factor(year), color = factor(year), weight = PWGTP)) +
+ ggplot2::geom_density(alpha = 0.3, linewidth = 1) +
+ ggplot2::scale_fill_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_color_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_x_continuous(
+ labels = function(x) paste0("$", format(x / 1000, big.mark = ","), "K"),
+ limits = c(0, quantile(local_all_years$earnings, 0.98))
+ ) +
+ ggplot2::labs(
+ title = "Local Government: Earnings Distribution by Year (Weighted)",
+ subtitle = "Overlaid densities show year-over-year shift",
+ x = "Earnings",
+ y = "Density"
+ ) +
+ ggplot2::theme_minimal(base_size = 14) +
+ ggplot2::theme(
+ plot.title = ggplot2::element_text(face = "bold"),
+ legend.position = "right"
+ )
+```
+
+```{r}
+#| label: overlay-state
+#| fig-width: 10
+#| fig-height: 6
+
+# State Government - all years overlaid (weighted)
+state_all_years <- derived_gov_employees |>
+ dplyr::filter(gov_level == "State Government")
+
+ggplot2::ggplot(state_all_years, ggplot2::aes(x = earnings, fill = factor(year), color = factor(year), weight = PWGTP)) +
+ ggplot2::geom_density(alpha = 0.3, linewidth = 1) +
+ ggplot2::scale_fill_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_color_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_x_continuous(
+ labels = function(x) paste0("$", format(x / 1000, big.mark = ","), "K"),
+ limits = c(0, quantile(state_all_years$earnings, 0.98))
+ ) +
+ ggplot2::labs(
+ title = "State Government: Earnings Distribution by Year (Weighted)",
+ subtitle = "Overlaid densities show year-over-year shift",
+ x = "Earnings",
+ y = "Density"
+ ) +
+ ggplot2::theme_minimal(base_size = 14) +
+ ggplot2::theme(
+ plot.title = ggplot2::element_text(face = "bold"),
+ legend.position = "right"
+ )
+```
+
+```{r}
+#| label: overlay-federal
+#| fig-width: 10
+#| fig-height: 6
+
+# Federal Government - all years overlaid (weighted)
+federal_all_years <- derived_gov_employees |>
+ dplyr::filter(gov_level == "Federal Government")
+
+ggplot2::ggplot(federal_all_years, ggplot2::aes(x = earnings, fill = factor(year), color = factor(year), weight = PWGTP)) +
+ ggplot2::geom_density(alpha = 0.3, linewidth = 1) +
+ ggplot2::scale_fill_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_color_viridis_d(option = "plasma", name = "Year") +
+ ggplot2::scale_x_continuous(
+ labels = function(x) paste0("$", format(x / 1000, big.mark = ","), "K"),
+ limits = c(0, quantile(federal_all_years$earnings, 0.98))
+ ) +
+ ggplot2::labs(
+ title = "Federal Government: Earnings Distribution by Year (Weighted)",
+ subtitle = "Overlaid densities show year-over-year shift",
+ x = "Earnings",
+ y = "Density"
+ ) +
+ ggplot2::theme_minimal(base_size = 14) +
+ ggplot2::theme(
+ plot.title = ggplot2::element_text(face = "bold"),
+ legend.position = "right"
+ )
+```
+
+
+## Summary: What the Distributions Tell Us
+
+```{r}
+#| label: distribution-summary
+#| results: asis
+
+# Extract key metrics for narrative
+accel_data <- accel_by_level$data
+
+# Get latest year stats
+latest <- accel_data |>
+ dplyr::filter(year == max(year)) |>
+ dplyr::select(group, mean_pct_chg, mean_accel, p90_p10_ratio)
+
+# Build narrative
+cat("**Key findings from distribution analysis:**\n\n")
+
+for (i in seq_len(nrow(latest))) {
+ grp <- latest$group[i]
+ chg <- latest$mean_pct_chg[i]
+ acc <- latest$mean_accel[i]
+ ratio <- latest$p90_p10_ratio[i]
+ 
+ direction <- ifelse(chg > 0, "increased", "decreased")
+ accel_word <- ifelse(!is.na(acc) && acc > 0, "accelerating", "decelerating")
+ 
+ cat(sprintf("- **%s**: Mean earnings %s %.1f%% in the latest year", grp, direction, abs(chg)))
+ if (!is.na(acc)) {
+ cat(sprintf(" (%s). ", accel_word))
+ } else {
+ cat(". ")
+ }
+ cat(sprintf("90/10 ratio = %.2f\n", ratio))
+}
+```
+
+
+## Technical Notes
+
+**Survey Weights:**
+
+All distribution diagnostics in this section use PUMS person weights (PWGTP) to produce population-representative estimates. This ensures the density curves, percentiles, and summary statistics reflect the actual population distribution, not the sample distribution.
+
+**Why ridge plots over overlaid densities?**
+
+Overlaid densities work for 2-3 years but become unreadable with more. Ridge plots handle many years cleanly and make temporal patterns obvious.
+
+**Why track percentiles instead of just mean/median?**
+
+Mean and median can both rise while inequality grows—if the 90th percentile rises faster than the 10th. The quantile plot catches this.
+
+**What counts as meaningful acceleration?**
+
+- `Accel` > ±2 percentage points is notable
+- `90/10 Δ` > ±0.3 suggests meaningful inequality change
+- Sustained patterns over multiple years matter more than single-year spikes
+
+**Caveats:**
+
+- Data represents the PUMA area, not just the city boundaries
+- Small sample sizes in some government levels may produce noisy distributions
+- Year 2022 is excluded due to PUMA boundary inconsistencies in tidycensus
+- These diagnostics do not incorporate replicate weights for standard error estimation—use the main analysis tables for statistical inference
