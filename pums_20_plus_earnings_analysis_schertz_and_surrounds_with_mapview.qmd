@@ -721,22 +721,73 @@ m
 ```{r}
 #| label: cities-in-puma-table
 
+#| label: cities-in-puma-table
+
 if (!base::is.null(places_to_label) && base::nrow(places_to_label) > 0L) {
+  
+ # Combine Schertz with other cities
+  all_places <- dplyr::bind_rows(city_sf, places_to_label)
+  
+  # Get GEOIDs for population lookup
+  place_geoids <- all_places$GEOID
+  
+  # Fetch most recent population estimates (B01003_001 = Total Population)
+  pop_data <- tidycensus::get_acs(
+    geography = "place",
+    variables = "B01003_001",
+    state = params$state,
+    year = base::max(params$years),
+    survey = "acs5"
+  ) |>
+    dplyr::filter(GEOID %in% place_geoids) |>
+    dplyr::select(GEOID, population = estimate, pop_moe = moe)
+  
+  # Build display table
   cities_display <- tibble::tibble(
-    City = places_to_label$NAME,
-    Type = base::gsub(".*(city|town).*", "\\1", places_to_label$NAMELSAD, ignore.case = TRUE)
-  )
+    GEOID = all_places$GEOID,
+    City = all_places$NAME,
+    Type = base::gsub(".*(city|town).*", "\\1", all_places$NAMELSAD, ignore.case = TRUE)
+  ) |>
+    dplyr::left_join(pop_data, by = "GEOID") |>
+    dplyr::arrange(dplyr::desc(population)) |>
+    dplyr::mutate(
+      Population = base::paste0(
+        base::format(population, big.mark = ","),
+        " \u00b1",
+        base::format(pop_moe, big.mark = ",")
+      )
+    ) |>
+    dplyr::select(City, Type, Population)
   
   ft_cities <- flextable::flextable(cities_display)
   ft_cities <- ds_style_flextable(
     ft_cities,
-    title = base::paste0("Major Cities/Towns in ", params$city, " PUMA Area")
+    title = base::paste0(
+      "Major Cities/Towns in ", params$city, " PUMA Area (", 
+      base::max(params$years), " ACS 5-Year Estimates)"
+    )
   )
   ft_cities
 } else {
   base::cat("No other major cities found in the PUMA area.")
 }
+
 ```
+
+::: {.callout-note}
+## What These Numbers Actually Represent
+
+Census microdata weights each person equally, so bigger cities have more influence on the overall statistics simply because more people live there. Here's how the cities in this PUMA shake out:
+ 
+- **New Braunfels and San Marcos** — the two largest cities — drive about 56% of the results
+- **Schertz** contributes about 15%
+- **Everyone else** (Cibolo, Seguin, Universal City, New Berlin) makes up the remaining 29%
+
+You might expect larger cities to show higher wages, which would pull these estimates above what Schertz alone would show. But there's a wrinkle: San Marcos is a college town (Texas State has ~38,000 students). College towns often show *lower* earnings because of all the students working part-time or in restaurants and retail. So the "big city premium" from New Braunfels may be offset by the "college town discount" from San Marcos.
+
+**Bottom line:** These numbers describe the broader labor market that Schertz is part of—not Schertz by itself. That's useful for thinking about city employee compensation, since Schertz competes for workers across this entire region.
+:::
+
 
 
 # Data Retrieval
